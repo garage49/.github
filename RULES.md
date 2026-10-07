@@ -57,8 +57,10 @@ public. A private repository that needs neither stays under `dirty49374`.
   (`Cargo.toml`, `package.json`, and any further version file the repository names) must say the
   same; every build fails if they disagree. Bump the file
   in a commit on `main`, then tag that commit. Before 1.0, a breaking change bumps MINOR.
-- **Snapshot version** (every non-tag build): `X.Y.(Z+1)-dev.N+g<sha>`, where `vX.Y.Z` is the last
-  release tag, `N` the commits since it and `<sha>` the 7-character commit. It sorts after the last
+- **Snapshot version** (every non-tag build): `<next>-dev.N+g<sha>`, where `vX.Y.Z` is the last
+  release tag, `<next>` is the version file's version when it is already above `X.Y.Z` (the coming
+  release is declared) and `X.Y.(Z+1)` otherwise, `N` the commits since the tag and `<sha>` the
+  7-character commit. It sorts after the last
   release and before the next one (the Go pseudo-version idea). Before any release:
   `<declared>-dev.N+g<sha>` with `N` = all commits. CI run numbers are not used: they are per
   workflow and cannot be recomputed from git.
