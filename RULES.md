@@ -24,6 +24,8 @@ public. A private repository that needs neither stays under `dirty49374`.
 
 - A repository goes public as a **new repository** with fresh history, not by flipping the
   visibility of the private one. Nothing from the private history becomes public.
+  The private repository stays as it is (it is not deleted); the public one starts from a single
+  initial commit of the content chosen for publication.
 - Before the first public push, its content is scanned for secrets (gitleaks) and for internal
   hostnames and addresses; internal operating notes stay out of it.
 - Pull-request builds of a public repository run on GitHub-hosted runners (free and unmetered for
