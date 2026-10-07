@@ -11,7 +11,9 @@ public. A private repository that needs neither stays under `dirty49374`.
 
 ## Packages and images
 
-- **npm scope `@garage49` for everything.** A private package is published only to the internal
+- **npm scope `@garage49` for everything** (Owner, 2026-10-07: existing `@agent-workshop/*` packages
+  move to `@garage49/*` at their next release, and the old names are deprecated on npmjs pointing
+  at the new ones). A private package is published only to the internal
   registry (verdaccio), a public package to npmjs. Verdaccio proxies
   `@garage49` to npmjs, so the internal registry serves both. Only garage49 npm org members can
   publish into the scope on npmjs, so outsiders cannot plant a same-named package. A private and a
@@ -52,7 +54,8 @@ public. A private repository that needs neither stays under `dirty49374`.
 ## Versions
 
 - **Release version**: SemVer `X.Y.Z`, from the tag `vX.Y.Z`. The project's version file
-  (`Cargo.toml`, `package.json`) must say the same; the release fails if it does not. Bump the file
+  (`Cargo.toml`, `package.json`, and any further version file the repository names) must say the
+  same; every build fails if they disagree. Bump the file
   in a commit on `main`, then tag that commit. Before 1.0, a breaking change bumps MINOR.
 - **Snapshot version** (every non-tag build): `X.Y.(Z+1)-dev.N+g<sha>`, where `vX.Y.Z` is the last
   release tag, `N` the commits since it and `<sha>` the 7-character commit. It sorts after the last
@@ -66,7 +69,8 @@ public. A private repository that needs neither stays under `dirty49374`.
 ## Assets
 
 `<name>-<os>-<arch>[.exe]` with `os` in `linux | macos | windows` (never `darwin`; it matches Rust's
-`std::env::consts::OS`) and `arch` in `x86_64 | aarch64`, plus `SHA256SUMS` in every release.
+`std::env::consts::OS`) and `arch` in `x86_64 | aarch64`. Every release carries `<asset>.sha256` beside each asset (what an
+installer fetching one asset verifies) and one `SHA256SUMS` listing them all.
 
 ## Using it
 

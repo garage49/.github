@@ -1,0 +1,2 @@
+self-hosted-runner:
+  labels: [linux-build, macos-build, windows-build]

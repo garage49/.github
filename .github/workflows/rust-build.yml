@@ -10,7 +10,7 @@
 #
 # main push -> test + build every target, workflow artifacts (snapshot version)
 # pull request -> test + build, nothing published
-# tag vX.Y.Z -> the same, then a GitHub Release with <name>-<os>-<arch> assets and SHA256SUMS
+# tag vX.Y.Z -> the same, then a GitHub Release with <name>-<os>-<arch> assets, <asset>.sha256 and SHA256SUMS
 # docker-image set -> image built on build-linux and pushed to the internal registry (the farm
 #   machine's environment variable INTERNAL_DOCKER_REGISTRY)
 #   (main: <snapshot tag>; release: X.Y.Z, plus latest when docker-latest)
@@ -34,6 +34,18 @@ on:
         description: JSON list from linux-x86_64, macos-aarch64, macos-x86_64, windows-x86_64
         type: string
         default: '["linux-x86_64","macos-aarch64","macos-x86_64"]'
+      version-files:
+        description: more files whose top-level version must equal the declared one (space-separated; .toml or .json)
+        type: string
+        default: ''
+      prebuild:
+        description: shell command run once in a node container before every cargo build/test (e.g. a web bundle)
+        type: string
+        default: ''
+      prebuild-path:
+        description: directory the prebuild produces, handed to every build and test job
+        type: string
+        default: ''
       test:
         description: run cargo test --workspace on Linux
         type: boolean
@@ -73,6 +85,14 @@ jobs:
         run: |
           v=$(cargo metadata --no-deps --format-version 1 | jq -r --arg p "${{ inputs.package }}" '.packages[] | select(.name == $p) | .version')
           [ -n "$v" ] || { echo "::error::package ${{ inputs.package }} not found"; exit 1; }
+          for f in ${{ inputs.version-files }}; do
+            case "$f" in
+              *.json) w=$(jq -r .version "$f") ;;
+              *.toml) w=$(sed -n 's/^version *= *"\(.*\)".*/\1/p' "$f" | head -1) ;;
+              *) echo "::error::version file $f: only .toml or .json"; exit 1 ;;
+            esac
+            [ "$w" = "$v" ] || { echo "::error::$f says version $w, ${{ inputs.package }} says $v; they must match"; exit 1; }
+          done
           echo "declared=$v" >>"$GITHUB_OUTPUT"
       - id: v
         uses: garage49/.github/actions/version@main
@@ -92,21 +112,38 @@ jobs:
             | . + {"runs-on": (if $h then (.hosted | tojson) else (["self-hosted", .label] | tojson) end)} | del(.label, .hosted)]')" >>"$GITHUB_OUTPUT"
           echo "linux=$(echo "$TARGETS" | jq -c 'index("linux-x86_64") != null')" >>"$GITHUB_OUTPUT"
 
+  prebuild:
+    if: inputs.prebuild != ''
+    runs-on: ${{ (github.event_name == 'pull_request' && !github.event.repository.private) && 'ubuntu-latest' || fromJSON('["self-hosted","linux-build"]') }}
+    container: node:lts-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - run: ${{ inputs.prebuild }}
+      - uses: actions/upload-artifact@v4
+        with: { name: prebuild, path: '${{ inputs.prebuild-path }}', retention-days: 1, include-hidden-files: true }
+
   test:
-    if: inputs.test
+    needs: prebuild
+    if: always() && inputs.test && needs.prebuild.result != 'failure' && needs.prebuild.result != 'cancelled'
     runs-on: ${{ (github.event_name == 'pull_request' && !github.event.repository.private) && 'ubuntu-latest' || fromJSON('["self-hosted","linux-build"]') }}
     container: rust:1-bookworm
     steps:
       - uses: actions/checkout@v4
+      - if: inputs.prebuild != ''
+        uses: actions/download-artifact@v4
+        with: { name: prebuild, path: '${{ inputs.prebuild-path }}' }
       - run: cargo test --workspace --locked
 
   linux:
-    needs: version
-    if: needs.version.outputs.linux == 'true'
+    needs: [version, prebuild]
+    if: always() && needs.version.outputs.linux == 'true' && needs.prebuild.result != 'failure' && needs.prebuild.result != 'cancelled'
     runs-on: ${{ (github.event_name == 'pull_request' && !github.event.repository.private) && 'ubuntu-latest' || fromJSON('["self-hosted","linux-build"]') }}
     container: rust:1-bookworm   # glibc 2.36: the oldest we ship to (ranch server)
     steps:
       - uses: actions/checkout@v4
+      - if: inputs.prebuild != ''
+        uses: actions/download-artifact@v4
+        with: { name: prebuild, path: '${{ inputs.prebuild-path }}' }
       - run: |
           bin=${{ inputs.bin || inputs.package }}
           cargo build --release --locked -p ${{ inputs.package }}
@@ -115,14 +152,17 @@ jobs:
         with: { name: '${{ inputs.name }}-linux-x86_64', path: dist/*, retention-days: 7 }
 
   native:
-    needs: version
-    if: needs.version.outputs.native != '[]'
+    needs: [version, prebuild]
+    if: always() && needs.version.result == 'success' && needs.version.outputs.native != '[]' && needs.prebuild.result != 'failure' && needs.prebuild.result != 'cancelled'
     strategy:
       matrix:
         include: ${{ fromJSON(needs.version.outputs.native) }}
     runs-on: ${{ fromJSON(matrix.runs-on) }}
     steps:
       - uses: actions/checkout@v4
+      - if: inputs.prebuild != ''
+        uses: actions/download-artifact@v4
+        with: { name: prebuild, path: '${{ inputs.prebuild-path }}' }
       - if: runner.os != 'Windows'
         shell: bash
         run: |
@@ -173,5 +213,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           V: ${{ needs.version.outputs.version }}
         run: |
-          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+          cd dist
+          assets=(*)
+          for f in "${assets[@]}"; do sha256sum "$f" > "$f.sha256"; done   # <asset>.sha256 beside each asset
+          sha256sum "${assets[@]}" > SHA256SUMS && cat SHA256SUMS
           gh release create "v$V" ./* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "v$V"
