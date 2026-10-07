@@ -11,8 +11,8 @@
 # main push -> test + build every target, workflow artifacts (snapshot version)
 # pull request -> test + build, nothing published
 # tag vX.Y.Z -> the same, then a GitHub Release with <name>-<os>-<arch> assets and SHA256SUMS
-# docker-image set -> image built on build-linux and pushed to the internal registry (org variable
-#   INTERNAL_DOCKER_REGISTRY)
+# docker-image set -> image built on build-linux and pushed to the internal registry (the farm
+#   machine's environment variable INTERNAL_DOCKER_REGISTRY)
 #   (main: <snapshot tag>; release: X.Y.Z, plus latest when docker-latest)
 name: rust-build
 on:
@@ -148,11 +148,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - env:
-          IMAGE: ${{ vars.INTERNAL_DOCKER_REGISTRY }}/${{ inputs.docker-image }}
+          NAME: ${{ inputs.docker-image }}
           TAG: ${{ needs.version.outputs.image-tag }}
           RELEASE: ${{ needs.version.outputs.release }}
           LATEST: ${{ inputs.docker-latest }}
         run: |
+          # internal endpoints are set on the farm machines (runner .env), never in this public repo
+          IMAGE="${INTERNAL_DOCKER_REGISTRY:?not set on this runner}/$NAME"
           docker build --pull -t "$IMAGE:$TAG" .
           docker push "$IMAGE:$TAG"
           if [ "$RELEASE" = true ] && [ "$LATEST" = true ]; then

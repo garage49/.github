@@ -12,11 +12,11 @@ public. A private repository that needs neither stays under `dirty49374`.
 ## Packages and images
 
 - **npm scope `@garage49` for everything.** A private package is published only to the internal
-  registry (verdaccio, org variable `INTERNAL_NPM_REGISTRY`), a public package to npmjs. Verdaccio proxies
+  registry (verdaccio), a public package to npmjs. Verdaccio proxies
   `@garage49` to npmjs, so the internal registry serves both. Only garage49 npm org members can
   publish into the scope on npmjs, so outsiders cannot plant a same-named package. A private and a
   public package must never share a name.
-- **Docker images** go to the internal registry (org variable `INTERNAL_DOCKER_REGISTRY`). For a
+- **Docker images** go to the internal registry. For a
   public repository it is decided per repository: the internal registry (built on the farm for
   `main` and tags only) or GHCR.
 
@@ -84,5 +84,7 @@ jobs:
 
 Versions are computed in one place, `actions/version` (`uses: garage49/.github/actions/version@main`).
 This repository is public on purpose (a public repository can only call public reusable workflows),
-so nothing internal — hostnames, addresses, credentials — is written here; internal values come
-from organization variables and secrets.
+so nothing internal — hostnames, addresses, credentials — is written here. Internal endpoints and
+publish credentials live on the build farm machines (runner environment `INTERNAL_DOCKER_REGISTRY`,
+`INTERNAL_NPM_REGISTRY`); GitHub Free does not give private repositories organization variables or
+secrets, and the jobs that publish internally run only on the farm anyway.
