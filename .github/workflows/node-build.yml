@@ -13,7 +13,8 @@
 # publishes; nothing is compiled twice.
 #   main push    -> checks, tarballs as workflow artifacts (snapshot version stamped in), snapshot image
 #   pull request -> checks and pack only
-#   tag vX.Y.Z   -> the same, then npm publish in the listed order (public repo: npmjs; private repo:
+#   tag vX.Y.Z   -> the same, then npm publish in the listed order (re-runnable: versions already on the
+#                   registry are skipped and their published tarballs kept) (public repo: npmjs; private repo:
 #                   the internal registry), release image, GitHub Release with the tarballs
 name: node-build
 on:
@@ -156,12 +157,29 @@ jobs:
           while read -r name; do
             tgz="$(echo "$name" | sed 's|^@||; s|/|-|')-$V.tgz"   # pnpm pack's file name
             [ -f "$tgz" ] || { echo "::error::$tgz missing"; ls; exit 1; }
+            if npm view "$name@$V" version --registry "$REG" >/dev/null 2>&1; then
+              # re-run after a partial publish: keep what the registry already serves, so the
+              # GitHub Release carries the published bytes, and say if this build differs
+              echo "= $name@$V already published; using the registry's tarball"
+              want=$(npm view "$name@$V" dist.integrity --registry "$REG")
+              have="sha512-$(openssl dgst -sha512 -binary "$tgz" | base64 -w0)"
+              [ "$want" = "$have" ] || echo "::warning::$name@$V: this build's tarball differs from the published one; the release keeps the published one"
+              rm -f "$tgz" && npm pack "$name@$V" --registry "$REG" >/dev/null
+              continue
+            fi
             echo "publish $name@$V ($tgz) -> $REG"
             npm publish "$tgz" --registry "$REG" --access "$ACCESS"
-            # the next package may depend on this one: wait until the registry serves it
-            for _ in $(seq 1 30); do npm view "$name@$V" version --registry "$REG" >/dev/null 2>&1 && break; sleep 10; done
-            npm view "$name@$V" version --registry "$REG" >/dev/null || { echo "::error::$name@$V not fetchable after publish"; exit 1; }
+            # the next package may depend on this one: wait until the registry serves it.
+            # Large first versions can take many minutes to appear (npm processes them first).
+            ok=
+            for wait in 10 10 20 20 30 30 60 60 60 60 120 120 120 120 120 120; do
+              npm view "$name@$V" version --registry "$REG" >/dev/null 2>&1 && { ok=1; break; }
+              sleep "$wait"
+            done
+            [ -n "$ok" ] || { echo "::error::$name@$V not fetchable 20 minutes after publish; re-run this workflow on the tag to continue (published versions are skipped)"; exit 1; }
           done < PUBLISH_ORDER
+      - uses: actions/upload-artifact@v4
+        with: { name: npm-published, path: npm-dist/, retention-days: 7 }
 
   release:
     needs: [version, publish]
@@ -170,7 +188,7 @@ jobs:
     concurrency: release-${{ github.ref }}
     steps:
       - uses: actions/download-artifact@v4
-        with: { name: npm-packages, path: npm-dist }
+        with: { name: npm-published, path: npm-dist }
       - run: rm -f npm-dist/PUBLISH_ORDER
       - uses: garage49/.github/actions/release@main
         with: { dir: npm-dist, version: '${{ needs.version.outputs.version }}' }
