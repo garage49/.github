@@ -11,6 +11,8 @@
 # main push -> test + build every target, workflow artifacts (snapshot version)
 # pull request -> test + build, nothing published
 # tag vX.Y.Z -> the same, then a GitHub Release with <name>-<os>-<arch> assets, <asset>.sha256 and SHA256SUMS
+# crates set -> on a release tag, cargo publish to crates.io with trusted publishing (OIDC, GitHub-hosted
+#   runner, no token; the crate must first be reserved by the Owner, build-chain's crates-bootstrap.sh)
 # targets '[]' -> a library: version check, test (and clippy) only; no binaries, no release assets
 # docker-image set -> image built on build-linux and pushed to the internal registry (the farm
 #   machine's environment variable INTERNAL_DOCKER_REGISTRY)
@@ -59,6 +61,10 @@ on:
         description: also run cargo clippy --workspace --all-targets in the test job; its exit status is a gate (deny lints in Cargo.toml)
         type: boolean
         default: false
+      crates:
+        description: JSON list of crates to publish to crates.io on a release tag, in publish order (dependencies first); public repositories only
+        type: string
+        default: '[]'
       docker-image:
         description: image name in the internal registry, built from <path>/Dockerfile; empty = none
         type: string
@@ -217,6 +223,40 @@ jobs:
             docker tag "$IMAGE:$TAG" "$IMAGE:latest" && docker push "$IMAGE:latest"
           fi
           echo "pushed $IMAGE:$TAG $( [ "$RELEASE" = true ] && [ "$LATEST" = true ] && echo '+ latest')" >>"$GITHUB_STEP_SUMMARY"
+
+  crates:
+    needs: [version, test]
+    if: always() && inputs.crates != '[]' && needs.version.outputs.release == 'true' && (needs.test.result == 'success' || needs.test.result == 'skipped')
+    runs-on: ubuntu-latest   # crates.io trusted publishing needs GitHub's OIDC token
+    permissions: { contents: read, id-token: write }
+    steps:
+      - if: github.event.repository.private
+        run: echo "::error::crates.io is public; a private repository has no crate registry yet (RULES.md)" && exit 1
+      - uses: actions/checkout@v4
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          CRATES: '${{ inputs.crates }}'
+          V: ${{ needs.version.outputs.version }}
+          UA: garage49-build (github.com/garage49/.github)
+        working-directory: ${{ inputs.path }}
+        run: |
+          set -euo pipefail
+          for c in $(echo "$CRATES" | jq -r '.[]'); do
+            if curl -fsS -A "$UA" "https://crates.io/api/v1/crates/$c/$V" >/dev/null 2>&1; then
+              echo "= $c@$V already published"; continue   # re-run after a partial publish
+            fi
+            echo "publish $c@$V -> crates.io"
+            cargo publish -p "$c" --locked
+            # the next crate may depend on this one: wait until crates.io serves it
+            ok=
+            for wait in 10 10 20 20 30 30 60 60 60 60 120 120; do
+              curl -fsS -A "$UA" "https://crates.io/api/v1/crates/$c/$V" >/dev/null 2>&1 && { ok=1; break; }
+              sleep "$wait"
+            done
+            [ -n "$ok" ] || { echo "::error::$c@$V not visible 10 minutes after publish; re-run on the tag to continue"; exit 1; }
+          done
 
   release:
     needs: [version, test, linux, native]

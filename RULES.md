@@ -94,6 +94,16 @@ installer fetching one asset verifies) and one `SHA256SUMS` listing them all.
 - Building and pushing an image is not a deployment: production upgrades of stateful services keep
   their own backup, candidate and digest-pin procedure.
 
+## Rust crates
+
+- A public crate goes to crates.io on a release tag only, from a GitHub-hosted runner with crates.io
+  trusted publishing (OIDC): no crates.io token exists anywhere (Owner, 2026-10-07). The repository
+  lists its crates in publish order (`crates:` of `rust-build.yml`).
+- crates.io can attach a trusted publisher only to an existing crate, so a new crate is first
+  reserved by the Owner: a one-time placeholder `0.0.0` publish, yanked at once, and the trusted
+  publisher (`<repo>`, workflow `build.yml`) registered; the build farm owner keeps the script for it.
+- A private crate has no registry yet; one is added when a project needs it.
+
 ## Using it
 
 Each repository has one workflow, `.github/workflows/build.yml`, that calls the shared ones it needs
