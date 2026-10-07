@@ -1,0 +1,175 @@
+# Shared build for Rust programs on the garage49 build farm (rules: RULES.md in this repository).
+# A repository calls it from its own .github/workflows/build.yml:
+#
+#   on: { push: { branches: [main], tags: ['v*'] }, pull_request: {}, workflow_dispatch: {} }
+#   permissions: { contents: write }
+#   jobs:
+#     build:
+#       uses: garage49/.github/.github/workflows/rust-build.yml@main
+#       with: { name: herdr-ranch, package: herdr-ranch, targets: '["linux-x86_64","macos-aarch64"]' }
+#
+# main push -> test + build every target, workflow artifacts (snapshot version)
+# pull request -> test + build, nothing published
+# tag vX.Y.Z -> the same, then a GitHub Release with <name>-<os>-<arch> assets and SHA256SUMS
+# docker-image set -> image built on build-linux and pushed to the internal registry (org variable
+#   INTERNAL_DOCKER_REGISTRY)
+#   (main: <snapshot tag>; release: X.Y.Z, plus latest when docker-latest)
+name: rust-build
+on:
+  workflow_call:
+    inputs:
+      name:
+        description: asset base name, <name>-<os>-<arch>
+        type: string
+        required: true
+      package:
+        description: cargo package to build (-p) and whose version is the declared version
+        type: string
+        required: true
+      bin:
+        description: binary name inside the package (default = package)
+        type: string
+        default: ''
+      targets:
+        description: JSON list from linux-x86_64, macos-aarch64, macos-x86_64, windows-x86_64
+        type: string
+        default: '["linux-x86_64","macos-aarch64","macos-x86_64"]'
+      test:
+        description: run cargo test --workspace on Linux
+        type: boolean
+        default: true
+      docker-image:
+        description: image name in the internal registry, built from ./Dockerfile; empty = none
+        type: string
+        default: ''
+      docker-latest:
+        description: also tag a release image latest (only for Keel-deployed services)
+        type: boolean
+        default: false
+    outputs:
+      version:
+        value: ${{ jobs.version.outputs.version }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Runner choice (RULES.md): a pull request of a PUBLIC repository never runs on the build farm; it
+# uses GitHub-hosted runners. Every other build uses the farm (labels linux-build, macos-build,
+# windows-build).
+
+jobs:
+  version:
+    runs-on: ${{ (github.event_name == 'pull_request' && !github.event.repository.private) && 'ubuntu-latest' || fromJSON('["self-hosted","linux-build"]') }}
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      image-tag: ${{ steps.v.outputs.image-tag }}
+      release: ${{ steps.v.outputs.release }}
+      native: ${{ steps.t.outputs.native }}
+      linux: ${{ steps.t.outputs.linux }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - id: d
+        run: |
+          v=$(cargo metadata --no-deps --format-version 1 | jq -r --arg p "${{ inputs.package }}" '.packages[] | select(.name == $p) | .version')
+          [ -n "$v" ] || { echo "::error::package ${{ inputs.package }} not found"; exit 1; }
+          echo "declared=$v" >>"$GITHUB_OUTPUT"
+      - id: v
+        uses: garage49/.github/actions/version@main
+        with: { declared: '${{ steps.d.outputs.declared }}' }
+      - id: t
+        env:
+          TARGETS: '${{ inputs.targets }}'
+          HOSTED: ${{ github.event_name == 'pull_request' && !github.event.repository.private }}
+        run: |
+          # one table: target -> farm label, GitHub-hosted image (public pull requests), rust triple, extension
+          map='{"macos-aarch64":{"label":"macos-build","hosted":"macos-15","triple":"aarch64-apple-darwin","ext":""},
+                "macos-x86_64":{"label":"macos-build","hosted":"macos-15-intel","triple":"x86_64-apple-darwin","ext":""},
+                "windows-x86_64":{"label":"windows-build","hosted":"windows-latest","triple":"x86_64-pc-windows-msvc","ext":".exe"}}'
+          echo "$TARGETS" | jq -e 'all(. as $t | ["linux-x86_64","macos-aarch64","macos-x86_64","windows-x86_64"] | index($t))' >/dev/null \
+            || { echo "::error::unknown target in $TARGETS"; exit 1; }
+          echo "native=$(echo "$TARGETS" | jq -c --argjson m "$map" --argjson h "$HOSTED" '[.[] | select(. != "linux-x86_64") | {target: .} + $m[.]
+            | . + {"runs-on": (if $h then (.hosted | tojson) else (["self-hosted", .label] | tojson) end)} | del(.label, .hosted)]')" >>"$GITHUB_OUTPUT"
+          echo "linux=$(echo "$TARGETS" | jq -c 'index("linux-x86_64") != null')" >>"$GITHUB_OUTPUT"
+
+  test:
+    if: inputs.test
+    runs-on: ${{ (github.event_name == 'pull_request' && !github.event.repository.private) && 'ubuntu-latest' || fromJSON('["self-hosted","linux-build"]') }}
+    container: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --workspace --locked
+
+  linux:
+    needs: version
+    if: needs.version.outputs.linux == 'true'
+    runs-on: ${{ (github.event_name == 'pull_request' && !github.event.repository.private) && 'ubuntu-latest' || fromJSON('["self-hosted","linux-build"]') }}
+    container: rust:1-bookworm   # glibc 2.36: the oldest we ship to (ranch server)
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          bin=${{ inputs.bin || inputs.package }}
+          cargo build --release --locked -p ${{ inputs.package }}
+          mkdir -p dist && cp "target/release/$bin" "dist/${{ inputs.name }}-linux-x86_64"
+      - uses: actions/upload-artifact@v4
+        with: { name: '${{ inputs.name }}-linux-x86_64', path: dist/*, retention-days: 7 }
+
+  native:
+    needs: version
+    if: needs.version.outputs.native != '[]'
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.version.outputs.native) }}
+    runs-on: ${{ fromJSON(matrix.runs-on) }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          bin=${{ inputs.bin || inputs.package }}
+          rustup target add ${{ matrix.triple }}
+          cargo build --release --locked -p ${{ inputs.package }} --target ${{ matrix.triple }}
+          mkdir -p dist && cp "target/${{ matrix.triple }}/release/$bin" "dist/${{ inputs.name }}-${{ matrix.target }}"
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin = '${{ inputs.bin || inputs.package }}'
+          cargo build --release --locked -p ${{ inputs.package }} --target ${{ matrix.triple }}
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "target/${{ matrix.triple }}/release/$bin.exe" "dist/${{ inputs.name }}-${{ matrix.target }}.exe"
+      - uses: actions/upload-artifact@v4
+        with: { name: '${{ inputs.name }}-${{ matrix.target }}', path: dist/*, retention-days: 7 }
+
+  docker:
+    needs: [version, test]
+    if: always() && inputs.docker-image != '' && github.event_name != 'pull_request' && needs.version.result == 'success' && (needs.test.result == 'success' || needs.test.result == 'skipped')
+    runs-on: [self-hosted, linux-build]
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          IMAGE: ${{ vars.INTERNAL_DOCKER_REGISTRY }}/${{ inputs.docker-image }}
+          TAG: ${{ needs.version.outputs.image-tag }}
+          RELEASE: ${{ needs.version.outputs.release }}
+          LATEST: ${{ inputs.docker-latest }}
+        run: |
+          docker build --pull -t "$IMAGE:$TAG" .
+          docker push "$IMAGE:$TAG"
+          if [ "$RELEASE" = true ] && [ "$LATEST" = true ]; then
+            docker tag "$IMAGE:$TAG" "$IMAGE:latest" && docker push "$IMAGE:latest"
+          fi
+          echo "pushed $IMAGE:$TAG $( [ "$RELEASE" = true ] && [ "$LATEST" = true ] && echo '+ latest')" >>"$GITHUB_STEP_SUMMARY"
+
+  release:
+    needs: [version, test, linux, native]
+    if: always() && needs.version.outputs.release == 'true' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+    runs-on: [self-hosted, linux-build]
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ needs.version.outputs.version }}
+        run: |
+          cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+          gh release create "v$V" ./* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "v$V"
