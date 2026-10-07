@@ -72,9 +72,28 @@ public. A private repository that needs neither stays under `dirty49374`.
 `std::env::consts::OS`) and `arch` in `x86_64 | aarch64`. Every release carries `<asset>.sha256` beside each asset (what an
 installer fetching one asset verifies) and one `SHA256SUMS` listing them all.
 
+## npm packages
+
+- Built **once** per run: install (`pnpm install --frozen-lockfile`), the repository's checks, then
+  the build's version is stamped into every workspace package and the published packages are packed.
+  Those exact tarballs are the workflow artifact, what the container installs (copied into
+  `<context>/npm/`, never rebuilt from source inside Docker) and what a release publishes.
+- npm tarballs are platform-independent, so they carry npm's own file name (`<scope>-<name>-<version>.tgz`),
+  not `<os>-<arch>`; the release lists them in `SHA256SUMS` with a `.sha256` each.
+- A release publishes the packages in the order the repository lists them (dependencies first) and
+  waits until each is fetchable before the next.
+- Public packages go to npmjs from a GitHub-hosted runner with npm trusted publishing (no token);
+  a package's very first publish may use a repository secret `NPM_TOKEN` until its trusted
+  publisher is registered on npmjs. Private packages go to the internal registry from the farm.
+- The old `@agent-workshop/*` names are deprecated on npmjs only after the `@garage49/*` release is
+  live and smoke-tested.
+- Building and pushing an image is not a deployment: production upgrades of stateful services keep
+  their own backup, candidate and digest-pin procedure.
+
 ## Using it
 
-Each repository has one workflow, `.github/workflows/build.yml`, that calls the shared one:
+Each repository has one workflow, `.github/workflows/build.yml`, that calls the shared ones it needs
+(`rust-build.yml`, `node-build.yml`, or both — they fill one GitHub Release per tag). A Rust example:
 
 ```yaml
 name: build
@@ -92,7 +111,8 @@ jobs:
       targets: '["linux-x86_64","macos-aarch64","macos-x86_64"]'
 ```
 
-Versions are computed in one place, `actions/version` (`uses: garage49/.github/actions/version@main`).
+Versions are computed in one place, `actions/version`; GitHub Releases are written in one place,
+`actions/release` (`uses: garage49/.github/actions/version@main`).
 This repository is public on purpose (a public repository can only call public reusable workflows),
 so nothing internal — hostnames, addresses, credentials — is written here. Internal endpoints and
 publish credentials live on the build farm machines (runner environment `INTERNAL_DOCKER_REGISTRY`,

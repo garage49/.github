@@ -1,0 +1,37 @@
+# Attaches release files to the GitHub Release of the current tag (garage49 RULES.md, "Assets").
+# Creates the release if it does not exist, otherwise adds to it, so several shared workflows called
+# by one repository (e.g. npm packages + a Rust binary) fill one release. Writes <file>.sha256 beside
+# every file and rebuilds SHA256SUMS from every .sha256 on the release, so the list is always whole.
+# Callers serialize with a job-level `concurrency: release-<ref>`.
+name: release
+description: garage49 GitHub Release upload
+inputs:
+  dir:
+    description: directory whose files are the release assets
+    required: true
+  version:
+    description: release version X.Y.Z (tag vX.Y.Z)
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        DIR: ${{ inputs.dir }}
+        TAG: v${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        cd "$DIR"
+        files=(*)
+        for f in "${files[@]}"; do sha256sum "$f" > "$f.sha256"; done
+        if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          gh release upload "$TAG" ./* --repo "$GITHUB_REPOSITORY" --clobber
+        else
+          gh release create "$TAG" ./* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "$TAG"
+        fi
+        sums=$(mktemp -d)
+        gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.sha256' --dir "$sums"
+        cat "$sums"/*.sha256 | sort -k2 > "$sums/SHA256SUMS"
+        gh release upload "$TAG" "$sums/SHA256SUMS" --repo "$GITHUB_REPOSITORY" --clobber
+        cat "$sums/SHA256SUMS"

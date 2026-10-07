@@ -34,6 +34,10 @@ on:
         description: JSON list from linux-x86_64, macos-aarch64, macos-x86_64, windows-x86_64
         type: string
         default: '["linux-x86_64","macos-aarch64","macos-x86_64"]'
+      path:
+        description: directory of the Cargo workspace inside the repository
+        type: string
+        default: '.'
       version-files:
         description: more files whose top-level version must equal the declared one (space-separated; .toml or .json)
         type: string
@@ -51,7 +55,7 @@ on:
         type: boolean
         default: true
       docker-image:
-        description: image name in the internal registry, built from ./Dockerfile; empty = none
+        description: image name in the internal registry, built from <path>/Dockerfile; empty = none
         type: string
         default: ''
       docker-latest:
@@ -83,7 +87,7 @@ jobs:
         with: { fetch-depth: 0 }
       - id: d
         run: |
-          v=$(cargo metadata --no-deps --format-version 1 | jq -r --arg p "${{ inputs.package }}" '.packages[] | select(.name == $p) | .version')
+          v=$(cargo metadata --no-deps --format-version 1 --manifest-path "${{ inputs.path }}/Cargo.toml" | jq -r --arg p "${{ inputs.package }}" '.packages[] | select(.name == $p) | .version')
           [ -n "$v" ] || { echo "::error::package ${{ inputs.package }} not found"; exit 1; }
           for f in ${{ inputs.version-files }}; do
             case "$f" in
@@ -133,6 +137,7 @@ jobs:
         uses: actions/download-artifact@v4
         with: { name: prebuild, path: '${{ inputs.prebuild-path }}' }
       - run: cargo test --workspace --locked
+        working-directory: ${{ inputs.path }}
 
   linux:
     needs: [version, prebuild]
@@ -146,8 +151,9 @@ jobs:
         with: { name: prebuild, path: '${{ inputs.prebuild-path }}' }
       - run: |
           bin=${{ inputs.bin || inputs.package }}
+          cd "${{ inputs.path }}"
           cargo build --release --locked -p ${{ inputs.package }}
-          mkdir -p dist && cp "target/release/$bin" "dist/${{ inputs.name }}-linux-x86_64"
+          mkdir -p "$GITHUB_WORKSPACE/dist" && cp "target/release/$bin" "$GITHUB_WORKSPACE/dist/${{ inputs.name }}-linux-x86_64"
       - uses: actions/upload-artifact@v4
         with: { name: '${{ inputs.name }}-linux-x86_64', path: dist/*, retention-days: 7 }
 
@@ -168,16 +174,18 @@ jobs:
         run: |
           bin=${{ inputs.bin || inputs.package }}
           rustup target add ${{ matrix.triple }}
+          cd "${{ inputs.path }}"
           cargo build --release --locked -p ${{ inputs.package }} --target ${{ matrix.triple }}
-          mkdir -p dist && cp "target/${{ matrix.triple }}/release/$bin" "dist/${{ inputs.name }}-${{ matrix.target }}"
+          mkdir -p "$GITHUB_WORKSPACE/dist" && cp "target/${{ matrix.triple }}/release/$bin" "$GITHUB_WORKSPACE/dist/${{ inputs.name }}-${{ matrix.target }}"
       - if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $bin = '${{ inputs.bin || inputs.package }}'
+          Set-Location '${{ inputs.path }}'
           cargo build --release --locked -p ${{ inputs.package }} --target ${{ matrix.triple }}
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item "target/${{ matrix.triple }}/release/$bin.exe" "dist/${{ inputs.name }}-${{ matrix.target }}.exe"
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE/dist" | Out-Null
+          Copy-Item "target/${{ matrix.triple }}/release/$bin.exe" "$env:GITHUB_WORKSPACE/dist/${{ inputs.name }}-${{ matrix.target }}.exe"
       - uses: actions/upload-artifact@v4
         with: { name: '${{ inputs.name }}-${{ matrix.target }}', path: dist/*, retention-days: 7 }
 
@@ -195,7 +203,7 @@ jobs:
         run: |
           # internal endpoints are set on the farm machines (runner .env), never in this public repo
           IMAGE="${INTERNAL_DOCKER_REGISTRY:?not set on this runner}/$NAME"
-          docker build --pull -t "$IMAGE:$TAG" .
+          docker build --pull -t "$IMAGE:$TAG" "${{ inputs.path }}"
           docker push "$IMAGE:$TAG"
           if [ "$RELEASE" = true ] && [ "$LATEST" = true ]; then
             docker tag "$IMAGE:$TAG" "$IMAGE:latest" && docker push "$IMAGE:latest"
@@ -206,15 +214,9 @@ jobs:
     needs: [version, test, linux, native]
     if: always() && needs.version.outputs.release == 'true' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
     runs-on: [self-hosted, linux-build]
+    concurrency: release-${{ github.ref }}
     steps:
       - uses: actions/download-artifact@v4
-        with: { path: dist, merge-multiple: true }
-      - env:
-          GH_TOKEN: ${{ github.token }}
-          V: ${{ needs.version.outputs.version }}
-        run: |
-          cd dist
-          assets=(*)
-          for f in "${assets[@]}"; do sha256sum "$f" > "$f.sha256"; done   # <asset>.sha256 beside each asset
-          sha256sum "${assets[@]}" > SHA256SUMS && cat SHA256SUMS
-          gh release create "v$V" ./* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "v$V"
+        with: { path: dist, merge-multiple: true, pattern: '${{ inputs.name }}-*' }
+      - uses: garage49/.github/actions/release@main
+        with: { dir: dist, version: '${{ needs.version.outputs.version }}' }

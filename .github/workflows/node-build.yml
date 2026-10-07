@@ -1,0 +1,181 @@
+# Shared build for npm packages in a pnpm workspace (rules: RULES.md in this repository).
+# A repository calls it from its own .github/workflows/build.yml:
+#
+#   on: { push: { branches: [main], tags: ['v*'] }, pull_request: {}, workflow_dispatch: {} }
+#   permissions: { contents: write, id-token: write }
+#   jobs:
+#     npm:
+#       uses: garage49/.github/.github/workflows/node-build.yml@main
+#       with: { packages: '["packages/core","packages/cli"]', checks: 'pnpm check && pnpm test' }
+#       secrets: inherit
+#
+# One build per run: install, checks, stamp the version into every workspace package, pack the
+# listed packages once. Those exact tarballs are what the container installs and what a release
+# publishes; nothing is compiled twice.
+#   main push    -> checks, tarballs as workflow artifacts (snapshot version stamped in), snapshot image
+#   pull request -> checks and pack only
+#   tag vX.Y.Z   -> the same, then npm publish in the listed order (public repo: npmjs; private repo:
+#                   the internal registry), release image, GitHub Release with the tarballs
+name: node-build
+on:
+  workflow_call:
+    inputs:
+      packages:
+        description: JSON list of package directories to pack and publish, in publish order (dependencies first)
+        type: string
+        required: true
+      checks:
+        description: shell command run after install, before packing (build, typecheck, tests, spec checks)
+        type: string
+        default: 'pnpm build && pnpm test'
+      docker-image:
+        description: image name in the internal registry; empty = none
+        type: string
+        default: ''
+      docker-context:
+        description: container build context; the tarballs are copied into <context>/npm/ before the build
+        type: string
+        default: '.'
+      docker-smoke:
+        description: shell command run against the built image (env IMAGE) before it is pushed
+        type: string
+        default: ''
+      docker-latest:
+        description: also tag a release image latest (only for Keel-deployed services)
+        type: boolean
+        default: false
+    secrets:
+      NPM_TOKEN:
+        description: optional npmjs token, only until npm trusted publishing is configured for every package
+        required: false
+    outputs:
+      version:
+        value: ${{ jobs.version.outputs.version }}
+
+# Runner choice (RULES.md): a pull request of a PUBLIC repository never runs on the build farm.
+# npmjs publishing runs on a GitHub-hosted runner, which npm trusted publishing (OIDC) requires.
+
+jobs:
+  version:
+    runs-on: ${{ (github.event_name == 'pull_request' && !github.event.repository.private) && 'ubuntu-latest' || fromJSON('["self-hosted","linux-build"]') }}
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      image-tag: ${{ steps.v.outputs.image-tag }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - id: d
+        env: { PACKAGES: '${{ inputs.packages }}' }
+        run: |
+          v=$(jq -r .version package.json)
+          for p in $(echo "$PACKAGES" | jq -r '.[]'); do
+            w=$(jq -r .version "$p/package.json")
+            [ "$w" = "$v" ] || { echo "::error::$p/package.json says $w, the root says $v; they must match"; exit 1; }
+          done
+          echo "declared=$v" >>"$GITHUB_OUTPUT"
+      - id: v
+        uses: garage49/.github/actions/version@main
+        with: { declared: '${{ steps.d.outputs.declared }}' }
+
+  build:
+    needs: version
+    runs-on: ${{ (github.event_name == 'pull_request' && !github.event.repository.private) && 'ubuntu-latest' || fromJSON('["self-hosted","linux-build"]') }}
+    container: node:24-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - run: corepack enable && pnpm install --frozen-lockfile
+      - run: ${{ inputs.checks }}
+      - name: stamp version and pack
+        env:
+          V: ${{ needs.version.outputs.version }}
+          PACKAGES: '${{ inputs.packages }}'
+        run: |
+          # every workspace package carries the build's version, so workspace:* resolves to it in the tarballs
+          npm pkg set version="$V"
+          pnpm -r exec npm pkg set version="$V"
+          mkdir -p "$GITHUB_WORKSPACE/npm-dist"
+          dirs=$(node -e 'for (const d of JSON.parse(process.env.PACKAGES)) console.log(d)')
+          for p in $dirs; do (cd "$p" && pnpm pack --pack-destination "$GITHUB_WORKSPACE/npm-dist"); done
+          # publish order travels with the tarballs
+          for p in $dirs; do node -p "require('./$p/package.json').name"; done > "$GITHUB_WORKSPACE/npm-dist/PUBLISH_ORDER"
+          ls -l "$GITHUB_WORKSPACE/npm-dist"
+      - uses: actions/upload-artifact@v4
+        with: { name: npm-packages, path: npm-dist/, retention-days: 7 }
+
+  docker:
+    needs: [version, build]
+    if: inputs.docker-image != '' && github.event_name != 'pull_request'
+    runs-on: [self-hosted, linux-build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: npm-packages, path: npm-dist }
+      - env:
+          NAME: ${{ inputs.docker-image }}
+          CONTEXT: ${{ inputs.docker-context }}
+          TAG: ${{ needs.version.outputs.image-tag }}
+          V: ${{ needs.version.outputs.version }}
+          RELEASE: ${{ needs.version.outputs.release }}
+          LATEST: ${{ inputs.docker-latest }}
+          SMOKE: ${{ inputs.docker-smoke }}
+        run: |
+          # internal endpoints are set on the farm machines (runner .env), never in this public repo
+          IMAGE="${INTERNAL_DOCKER_REGISTRY:?not set on this runner}/$NAME"
+          rm -rf "$CONTEXT/npm" && mkdir -p "$CONTEXT/npm" && cp npm-dist/*.tgz "$CONTEXT/npm/"
+          docker build --pull --build-arg VERSION="$V" -t "$IMAGE:$TAG" "$CONTEXT"
+          if [ -n "$SMOKE" ]; then IMAGE="$IMAGE:$TAG" bash -c "$SMOKE"; fi
+          docker push "$IMAGE:$TAG"
+          if [ "$RELEASE" = true ] && [ "$LATEST" = true ]; then
+            docker tag "$IMAGE:$TAG" "$IMAGE:latest" && docker push "$IMAGE:latest"
+          fi
+          echo "pushed $IMAGE:$TAG" >>"$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: [version, build, docker]
+    if: always() && needs.version.outputs.release == 'true' && needs.build.result == 'success' && (needs.docker.result == 'success' || needs.docker.result == 'skipped')
+    # public -> npmjs from a GitHub-hosted runner (trusted publishing); private -> internal registry from the farm
+    runs-on: ${{ github.event.repository.private && fromJSON('["self-hosted","linux-build"]') || 'ubuntu-latest' }}
+    permissions: { contents: read, id-token: write }
+    steps:
+      - uses: actions/setup-node@v4
+        with: { node-version: 24 }
+      - run: npm install -g npm@latest   # trusted publishing needs npm >= 11.5
+      - uses: actions/download-artifact@v4
+        with: { name: npm-packages, path: npm-dist }
+      - env:
+          PRIVATE: ${{ github.event.repository.private }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          V: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$PRIVATE" = true ]; then
+            REG="${INTERNAL_NPM_REGISTRY:?not set on this runner}"     # credential: the farm user's ~/.npmrc
+            ACCESS=restricted
+          else
+            REG=https://registry.npmjs.org
+            ACCESS=public
+            if [ -n "${NODE_AUTH_TOKEN:-}" ]; then echo "//registry.npmjs.org/:_authToken=\${NODE_AUTH_TOKEN}" > ~/.npmrc; fi
+          fi
+          cd npm-dist
+          while read -r name; do
+            tgz="$(echo "$name" | sed 's|^@||; s|/|-|')-$V.tgz"   # pnpm pack's file name
+            [ -f "$tgz" ] || { echo "::error::$tgz missing"; ls; exit 1; }
+            echo "publish $name@$V ($tgz) -> $REG"
+            npm publish "$tgz" --registry "$REG" --access "$ACCESS"
+            # the next package may depend on this one: wait until the registry serves it
+            for _ in $(seq 1 30); do npm view "$name@$V" version --registry "$REG" >/dev/null 2>&1 && break; sleep 10; done
+            npm view "$name@$V" version --registry "$REG" >/dev/null || { echo "::error::$name@$V not fetchable after publish"; exit 1; }
+          done < PUBLISH_ORDER
+
+  release:
+    needs: [version, publish]
+    if: always() && needs.version.outputs.release == 'true' && needs.publish.result == 'success'
+    runs-on: [self-hosted, linux-build]
+    concurrency: release-${{ github.ref }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: npm-packages, path: npm-dist }
+      - run: rm -f npm-dist/PUBLISH_ORDER
+      - uses: garage49/.github/actions/release@main
+        with: { dir: npm-dist, version: '${{ needs.version.outputs.version }}' }
