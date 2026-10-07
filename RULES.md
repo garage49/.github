@@ -82,9 +82,11 @@ installer fetching one asset verifies) and one `SHA256SUMS` listing them all.
   not `<os>-<arch>`; the release lists them in `SHA256SUMS` with a `.sha256` each.
 - A release publishes the packages in the order the repository lists them (dependencies first) and
   waits until each is fetchable before the next.
-- Public packages go to npmjs from a GitHub-hosted runner with npm trusted publishing (no token);
-  a package's very first publish may use a repository secret `NPM_TOKEN` until its trusted
-  publisher is registered on npmjs. Private packages go to the internal registry from the farm.
+- Public packages go to npmjs from a GitHub-hosted runner with npm trusted publishing: no npm
+  token exists anywhere. npm can attach a trusted publisher only to an existing package, so a new
+  package is first reserved by the Owner with a one-time placeholder `0.0.0` publish (2FA) and its
+  trusted publisher (`<repo>`, workflow `build.yml`) is registered; the build farm owner keeps the
+  script for it. Private packages go to the internal registry from the farm.
 - The old `@agent-workshop/*` names are deprecated on npmjs only after the `@garage49/*` release is
   live and smoke-tested.
 - Building and pushing an image is not a deployment: production upgrades of stateful services keep

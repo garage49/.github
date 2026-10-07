@@ -7,7 +7,6 @@
 #     npm:
 #       uses: garage49/.github/.github/workflows/node-build.yml@main
 #       with: { packages: '["packages/core","packages/cli"]', checks: 'pnpm check && pnpm test' }
-#       secrets: inherit
 #
 # One build per run: install, checks, stamp the version into every workspace package, pack the
 # listed packages once. Those exact tarballs are what the container installs and what a release
@@ -44,10 +43,6 @@ on:
         description: also tag a release image latest (only for Keel-deployed services)
         type: boolean
         default: false
-    secrets:
-      NPM_TOKEN:
-        description: optional npmjs token, only until npm trusted publishing is configured for every package
-        required: false
     outputs:
       version:
         value: ${{ jobs.version.outputs.version }}
@@ -147,7 +142,6 @@ jobs:
         with: { name: npm-packages, path: npm-dist }
       - env:
           PRIVATE: ${{ github.event.repository.private }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           V: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
@@ -156,8 +150,7 @@ jobs:
             ACCESS=restricted
           else
             REG=https://registry.npmjs.org
-            ACCESS=public
-            if [ -n "${NODE_AUTH_TOKEN:-}" ]; then echo "//registry.npmjs.org/:_authToken=\${NODE_AUTH_TOKEN}" > ~/.npmrc; fi
+            ACCESS=public    # npm trusted publishing: OIDC from this job, no token
           fi
           cd npm-dist
           while read -r name; do
