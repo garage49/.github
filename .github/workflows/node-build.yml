@@ -169,14 +169,17 @@ jobs:
             fi
             echo "publish $name@$V ($tgz) -> $REG"
             npm publish "$tgz" --registry "$REG" --access "$ACCESS"
-            # the next package may depend on this one: wait until the registry serves it.
-            # Large first versions can take many minutes to appear (npm processes them first).
+            # npm publish exited 0, so the registry has accepted it. Wait until it is served, so a
+            # consumer never sees a package whose dependency is missing yet; ask the registry directly
+            # with a cache-busting query, because npm's own cache and the CDN can keep the packument
+            # read before the publish for many minutes (v0.1.1 of garage49-tui: 18 minutes).
             ok=
             for wait in 10 10 20 20 30 30 60 60 60 60 120 120 120 120 120 120; do
-              npm view "$name@$V" version --registry "$REG" >/dev/null 2>&1 && { ok=1; break; }
+              curl -fsS -H 'Cache-Control: no-cache' "${REG%/}/$(echo "$name" | sed 's|/|%2f|')?t=$(date +%s%N)" \
+                | jq -e --arg v "$V" '.versions[$v]' >/dev/null 2>&1 && { ok=1; break; }
               sleep "$wait"
             done
-            [ -n "$ok" ] || { echo "::error::$name@$V not fetchable 20 minutes after publish; re-run this workflow on the tag to continue (published versions are skipped)"; exit 1; }
+            [ -n "$ok" ] || echo "::warning::$name@$V was accepted by the registry but is not served yet after 20 minutes; continuing"
           done < PUBLISH_ORDER
       - uses: actions/upload-artifact@v4
         with: { name: npm-published, path: npm-dist/, retention-days: 7 }

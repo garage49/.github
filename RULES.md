@@ -83,7 +83,9 @@ installer fetching one asset verifies) and one `SHA256SUMS` listing them all.
 - npm tarballs are platform-independent, so they carry npm's own file name (`<scope>-<name>-<version>.tgz`),
   not `<os>-<arch>`; the release lists them in `SHA256SUMS` with a `.sha256` each.
 - A release publishes the packages in the order the repository lists them (dependencies first) and
-  waits until each is fetchable before the next.
+  waits until the registry serves each before the next (asked directly, past npm's cache and the
+  CDN). A package the registry accepted but does not serve after 20 minutes is a warning, not a
+  failed release.
 - Public packages go to npmjs from a GitHub-hosted runner with npm trusted publishing: no npm
   token exists anywhere. npm can attach a trusted publisher only to an existing package, so a new
   package is first reserved by the Owner with a one-time placeholder `0.0.0` publish (2FA) and its
