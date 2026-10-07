@@ -117,7 +117,7 @@ on:
   push: { branches: [main], tags: ['v*'] }
   pull_request: {}
   workflow_dispatch: {}
-permissions: { contents: write }
+permissions: { contents: write, id-token: write }   # every caller grants both: shared jobs publish through OIDC
 jobs:
   build:
     uses: garage49/.github/.github/workflows/rust-build.yml@main
