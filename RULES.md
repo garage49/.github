@@ -115,6 +115,9 @@ jobs:
       targets: '["linux-x86_64","macos-aarch64","macos-x86_64"]'
 ```
 
+A Rust **library** passes `targets: '[]'`: the version check and tests run (plus `clippy: true` for a
+clippy gate), and no binaries or release assets are built.
+
 Versions are computed in one place, `actions/version`; GitHub Releases are written in one place,
 `actions/release` (`uses: garage49/.github/actions/version@main`).
 This repository is public on purpose (a public repository can only call public reusable workflows),

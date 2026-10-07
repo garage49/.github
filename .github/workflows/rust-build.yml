@@ -11,6 +11,7 @@
 # main push -> test + build every target, workflow artifacts (snapshot version)
 # pull request -> test + build, nothing published
 # tag vX.Y.Z -> the same, then a GitHub Release with <name>-<os>-<arch> assets, <asset>.sha256 and SHA256SUMS
+# targets '[]' -> a library: version check, test (and clippy) only; no binaries, no release assets
 # docker-image set -> image built on build-linux and pushed to the internal registry (the farm
 #   machine's environment variable INTERNAL_DOCKER_REGISTRY)
 #   (main: <snapshot tag>; release: X.Y.Z, plus latest when docker-latest)
@@ -31,7 +32,7 @@ on:
         type: string
         default: ''
       targets:
-        description: JSON list from linux-x86_64, macos-aarch64, macos-x86_64, windows-x86_64
+        description: JSON list from linux-x86_64, macos-aarch64, macos-x86_64, windows-x86_64; '[]' for a library (test only, no assets)
         type: string
         default: '["linux-x86_64","macos-aarch64","macos-x86_64"]'
       path:
@@ -54,6 +55,10 @@ on:
         description: run cargo test --workspace on Linux
         type: boolean
         default: true
+      clippy:
+        description: also run cargo clippy --workspace --all-targets in the test job; its exit status is a gate (deny lints in Cargo.toml)
+        type: boolean
+        default: false
       docker-image:
         description: image name in the internal registry, built from <path>/Dockerfile; empty = none
         type: string
@@ -138,6 +143,9 @@ jobs:
         with: { name: prebuild, path: '${{ inputs.prebuild-path }}' }
       - run: cargo test --workspace --locked
         working-directory: ${{ inputs.path }}
+      - if: inputs.clippy
+        run: rustup component add clippy && cargo clippy --workspace --all-targets --locked
+        working-directory: ${{ inputs.path }}
 
   linux:
     needs: [version, prebuild]
@@ -212,7 +220,7 @@ jobs:
 
   release:
     needs: [version, test, linux, native]
-    if: always() && needs.version.outputs.release == 'true' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+    if: always() && inputs.targets != '[]' && needs.version.outputs.release == 'true' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
     runs-on: [self-hosted, linux-build]
     concurrency: release-${{ github.ref }}
     steps:
