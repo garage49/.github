@@ -30,6 +30,10 @@ public. A private repository that needs neither stays under `dirty49374`.
   hostnames and addresses; internal operating notes stay out of it.
 - Pull-request builds of a public repository run on GitHub-hosted runners (free and unmetered for
   public repositories); only `main` and tag builds may use the build farm.
+  Two settings back this up: the farm's runner group admits public repositories (for `main` and
+  tag builds), and the organization requires approval before any outside contributor's pull
+  request runs a workflow at all — a fork can edit the workflow file itself, so routing alone is
+  not enough.
 
 ## Triggers
 
