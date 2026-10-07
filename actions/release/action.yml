@@ -1,5 +1,5 @@
 # Attaches release files to the GitHub Release of the current tag (garage49 RULES.md, "Assets").
-# Creates the release if it does not exist, otherwise adds to it, so several shared workflows called
+# Creates the release if it does not exist, otherwise adds only the files it does not carry yet, so several shared workflows called
 # by one repository (e.g. npm packages + a Rust binary) fill one release. Writes <file>.sha256 beside
 # every file and rebuilds SHA256SUMS from every .sha256 on the release, so the list is always whole.
 # Callers serialize with a job-level `concurrency: release-<ref>`.
@@ -26,7 +26,11 @@ runs:
         files=(*)
         for f in "${files[@]}"; do sha256sum "$f" > "$f.sha256"; done
         if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-          gh release upload "$TAG" ./* --repo "$GITHUB_REPOSITORY" --clobber
+          # a re-run never replaces what a release already carries: published bytes stay published
+          have=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          new=()
+          for f in ./*; do grep -qxF "${f#./}" <<<"$have" && echo "= ${f#./} already on $TAG" || new+=("$f"); done
+          [ ${#new[@]} -eq 0 ] || gh release upload "$TAG" "${new[@]}" --repo "$GITHUB_REPOSITORY"
         else
           gh release create "$TAG" ./* --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --title "$TAG"
         fi
