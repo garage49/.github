@@ -183,7 +183,7 @@ jobs:
           IMAGE: ${{ inputs.docker-image }}
         run: |
           bin=${{ inputs.bin || inputs.package }}
-          extra=$(echo "$EXTRA" | jq -r '.[]')
+          extra=$(echo "$EXTRA" | tr -d '[]"' | tr ',' ' ')   # a JSON list of names; no jq in rust:1-bookworm
           cd "${{ inputs.path }}"
           cargo build --release --locked -p ${{ inputs.package }} $(for p in $extra; do printf -- '-p %s ' "$p"; done)
           mkdir -p "$GITHUB_WORKSPACE/dist" && cp "target/release/$bin" "$GITHUB_WORKSPACE/dist/${{ inputs.name }}-linux-x86_64"
