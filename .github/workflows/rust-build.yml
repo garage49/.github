@@ -14,8 +14,8 @@
 # crates set -> on a release tag, cargo publish to crates.io with trusted publishing (OIDC, GitHub-hosted
 #   runner, no token; the crate must first be reserved by the Owner, build-chain's crates-bootstrap.sh)
 # targets '[]' -> a library: version check, test (and clippy) only; no binaries, no release assets
-# docker-image set -> image built on build-linux and pushed to the internal registry (the farm
-#   machine's environment variable INTERNAL_DOCKER_REGISTRY)
+# docker-image set -> image built on build-linux, checked with docker-smoke if given, and pushed to the
+#   internal registry (the farm machine's environment variable INTERNAL_DOCKER_REGISTRY)
 #   (main: <snapshot tag>; release: X.Y.Z, plus latest when docker-latest)
 name: rust-build
 on:
@@ -67,6 +67,10 @@ on:
         default: '[]'
       docker-image:
         description: image name in the internal registry, built from <path>/Dockerfile; empty = none
+        type: string
+        default: ''
+      docker-smoke:
+        description: shell command run against the built image (env IMAGE) before it is pushed
         type: string
         default: ''
       docker-latest:
@@ -214,10 +218,12 @@ jobs:
           TAG: ${{ needs.version.outputs.image-tag }}
           RELEASE: ${{ needs.version.outputs.release }}
           LATEST: ${{ inputs.docker-latest }}
+          SMOKE: ${{ inputs.docker-smoke }}
         run: |
           # internal endpoints are set on the farm machines (runner .env), never in this public repo
           IMAGE="${INTERNAL_DOCKER_REGISTRY:?not set on this runner}/$NAME"
           docker build --pull -t "$IMAGE:$TAG" "${{ inputs.path }}"
+          if [ -n "$SMOKE" ]; then IMAGE="$IMAGE:$TAG" bash -c "$SMOKE"; fi
           docker push "$IMAGE:$TAG"
           if [ "$RELEASE" = true ] && [ "$LATEST" = true ]; then
             docker tag "$IMAGE:$TAG" "$IMAGE:latest" && docker push "$IMAGE:latest"
