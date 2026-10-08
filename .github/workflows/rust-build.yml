@@ -14,8 +14,11 @@
 # crates set -> on a release tag, cargo publish to crates.io with trusted publishing (OIDC, GitHub-hosted
 #   runner, no token; the crate must first be reserved by the Owner, build-chain's crates-bootstrap.sh)
 # targets '[]' -> a library: version check, test (and clippy) only; no binaries, no release assets
-# docker-image set -> image built on build-linux, checked with docker-smoke if given, and pushed to the
-#   internal registry (the farm machine's environment variable INTERNAL_DOCKER_REGISTRY)
+# docker-image set -> image built on build-linux from <path>/Dockerfile, checked with docker-smoke if given, and
+#   pushed to the internal registry (the farm machine's environment variable INTERNAL_DOCKER_REGISTRY).
+#   The image is never compiled in Docker: the linux job's release binaries (the program plus any
+#   docker-packages, each named after its binary) are put in <path>/docker-bin/ and the Dockerfile COPYs them.
+#   Needs linux-x86_64 in targets.
 #   (main: <snapshot tag>; release: X.Y.Z, plus latest when docker-latest)
 name: rust-build
 on:
@@ -69,6 +72,10 @@ on:
         description: image name in the internal registry, built from <path>/Dockerfile; empty = none
         type: string
         default: ''
+      docker-packages:
+        description: JSON list of further cargo packages whose release binary (named like the package) also goes into <path>/docker-bin/
+        type: string
+        default: '[]'
       docker-smoke:
         description: shell command run against the built image (env IMAGE) before it is pushed
         type: string
@@ -119,6 +126,7 @@ jobs:
       - id: t
         env:
           TARGETS: '${{ inputs.targets }}'
+          IMAGE: ${{ inputs.docker-image }}
           HOSTED: ${{ github.event_name == 'pull_request' && !github.event.repository.private }}
         run: |
           # one table: target -> farm label, GitHub-hosted image (public pull requests), rust triple, extension
@@ -130,6 +138,9 @@ jobs:
           echo "native=$(echo "$TARGETS" | jq -c --argjson m "$map" --argjson h "$HOSTED" '[.[] | select(. != "linux-x86_64") | {target: .} + $m[.]
             | . + {"runs-on": (if $h then (.hosted | tojson) else (["self-hosted", .label] | tojson) end)} | del(.label, .hosted)]')" >>"$GITHUB_OUTPUT"
           echo "linux=$(echo "$TARGETS" | jq -c 'index("linux-x86_64") != null')" >>"$GITHUB_OUTPUT"
+          if [ -n "$IMAGE" ] && ! echo "$TARGETS" | jq -e 'index("linux-x86_64") != null' >/dev/null; then
+            echo "::error::docker-image needs linux-x86_64 in targets: the image is built from the linux binaries"; exit 1
+          fi
 
   prebuild:
     if: inputs.prebuild != ''
@@ -167,13 +178,24 @@ jobs:
       - if: inputs.prebuild != ''
         uses: actions/download-artifact@v4
         with: { name: prebuild, path: '${{ inputs.prebuild-path }}' }
-      - run: |
+      - env:
+          EXTRA: '${{ inputs.docker-packages }}'
+          IMAGE: ${{ inputs.docker-image }}
+        run: |
           bin=${{ inputs.bin || inputs.package }}
+          extra=$(echo "$EXTRA" | jq -r '.[]')
           cd "${{ inputs.path }}"
-          cargo build --release --locked -p ${{ inputs.package }}
+          cargo build --release --locked -p ${{ inputs.package }} $(for p in $extra; do printf -- '-p %s ' "$p"; done)
           mkdir -p "$GITHUB_WORKSPACE/dist" && cp "target/release/$bin" "$GITHUB_WORKSPACE/dist/${{ inputs.name }}-linux-x86_64"
+          # the image's binaries: these exact files, never rebuilt in Docker (RULES.md)
+          if [ -n "$IMAGE" ]; then
+            mkdir -p "$GITHUB_WORKSPACE/docker-bin" && cp "target/release/$bin" $(for p in $extra; do echo "target/release/$p"; done) "$GITHUB_WORKSPACE/docker-bin/"
+          fi
       - uses: actions/upload-artifact@v4
         with: { name: '${{ inputs.name }}-linux-x86_64', path: dist/*, retention-days: 7 }
+      - if: inputs.docker-image != ''
+        uses: actions/upload-artifact@v4
+        with: { name: docker-bin, path: docker-bin/*, retention-days: 7 }
 
   native:
     needs: [version, prebuild]
@@ -208,11 +230,14 @@ jobs:
         with: { name: '${{ inputs.name }}-${{ matrix.target }}', path: dist/*, retention-days: 7 }
 
   docker:
-    needs: [version, test]
-    if: always() && inputs.docker-image != '' && github.event_name != 'pull_request' && needs.version.result == 'success' && (needs.test.result == 'success' || needs.test.result == 'skipped')
+    needs: [version, test, linux]
+    if: always() && inputs.docker-image != '' && github.event_name != 'pull_request' && needs.version.result == 'success' && (needs.test.result == 'success' || needs.test.result == 'skipped') && needs.linux.result == 'success'
     runs-on: [self-hosted, linux-build]
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: docker-bin, path: '${{ inputs.path }}/docker-bin' }
+      - run: chmod +x "${{ inputs.path }}"/docker-bin/* && ls -l "${{ inputs.path }}/docker-bin"   # artifacts drop the exec bit
       - env:
           NAME: ${{ inputs.docker-image }}
           TAG: ${{ needs.version.outputs.image-tag }}

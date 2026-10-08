@@ -21,6 +21,12 @@ public. A private repository that needs neither stays under `dirty49374`.
 - **Docker images** go to the internal registry. For a
   public repository it is decided per repository: the internal registry (built on the farm for
   `main` and tags only) or GHCR.
+- **An image is never compiled in Docker** (Owner, 2026-10-08). The Dockerfile only assembles a
+  runtime from the exact artifacts the run already built, so a release asset and the image carry
+  the same bytes and nothing is built twice: npm tarballs in `<context>/npm/`, Rust release binaries
+  (built in `rust:1-bookworm`, so the runtime base is Debian bookworm or newer) in
+  `<path>/docker-bin/`, each named after its binary. A Dockerfile has no build stage; a
+  `.dockerignore` allow-list must admit that directory.
 
 ## Making a repository public
 
