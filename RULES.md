@@ -25,8 +25,9 @@ public. A private repository that needs neither stays under `dirty49374`.
   runtime from the exact artifacts the run already built, so a release asset and the image carry
   the same bytes and nothing is built twice: npm tarballs in `<context>/npm/`, Rust release binaries
   (built in `rust:1-bookworm`, so the runtime base is Debian bookworm or newer) in
-  `<path>/docker-bin/`, each named after its binary. A Dockerfile has no build stage; a
-  `.dockerignore` allow-list must admit that directory.
+  `<path>/docker-bin/`, each named after its binary, and a Rust workflow's `prebuild` output (e.g. a
+  web bundle) at its `prebuild-path`. A Dockerfile has no build stage; a `.dockerignore` allow-list
+  must admit those directories.
 
 ## Making a repository public
 

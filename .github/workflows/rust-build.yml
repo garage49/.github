@@ -53,7 +53,7 @@ on:
         type: string
         default: ''
       prebuild-path:
-        description: directory the prebuild produces, handed to every build and test job
+        description: directory the prebuild produces, handed to every build, test and docker job
         type: string
         default: ''
       test:
@@ -235,6 +235,9 @@ jobs:
     runs-on: [self-hosted, linux-build]
     steps:
       - uses: actions/checkout@v4
+      - if: inputs.prebuild != ''
+        uses: actions/download-artifact@v4
+        with: { name: prebuild, path: '${{ inputs.prebuild-path }}' }
       - uses: actions/download-artifact@v4
         with: { name: docker-bin, path: '${{ inputs.path }}/docker-bin' }
       - run: chmod +x "${{ inputs.path }}"/docker-bin/* && ls -l "${{ inputs.path }}/docker-bin"   # artifacts drop the exec bit
