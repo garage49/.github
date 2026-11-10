@@ -83,6 +83,7 @@ jobs:
     needs: version
     runs-on: ${{ (github.event_name == 'pull_request' && !github.event.repository.private) && 'ubuntu-latest' || fromJSON('["self-hosted","linux-build"]') }}
     container: python:${{ inputs.python-version }}-bookworm
+    defaults: { run: { shell: bash } }   # a job container's default shell is sh
     env:
       PIP_DISABLE_PIP_VERSION_CHECK: '1'
       PIP_ROOT_USER_ACTION: ignore
