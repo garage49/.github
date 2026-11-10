@@ -1,0 +1,165 @@
+# Shared build for a Python package (rules: RULES.md in this repository).
+# A repository calls it from its own .github/workflows/build.yml:
+#
+#   on: { push: { branches: [main], tags: ['v*'] }, pull_request: {}, workflow_dispatch: {} }
+#   permissions: { contents: write, id-token: write }
+#   jobs:
+#     python:
+#       uses: garage49/.github/.github/workflows/python-build.yml@main
+#       with: { project: server, docker-image: my-server }
+#
+# One build per run: install the project with its test extra, run the checks, stamp the build's
+# version into pyproject.toml, build the project's wheel once and download its dependencies as binary
+# wheels for the same interpreter and platform. Those exact wheels are what the container installs
+# (copied into <context>/wheels/, never built inside Docker) and what a release attaches.
+#   main push    -> checks, wheels as workflow artifacts (snapshot version stamped in), snapshot image
+#   pull request -> checks and wheels only
+#   tag vX.Y.Z   -> the same, release image, GitHub Release with the project's wheel
+# The version file is <project>/pyproject.toml ([project] version). The build container is
+# python:<python-version>-bookworm, so the dependency wheels match a python:<python-version>-*-bookworm
+# runtime image on the farm's architecture.
+name: python-build
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: directory holding pyproject.toml (the version file)
+        type: string
+        default: '.'
+      python-version:
+        description: CPython minor version of the build and of the runtime image
+        type: string
+        default: '3.11'
+      checks:
+        description: shell command run in the project directory after installing it with its test extra
+        type: string
+        default: 'python -m pytest'
+      test-extra:
+        description: optional-dependencies group installed for the checks; empty = none
+        type: string
+        default: 'test'
+      docker-image:
+        description: image name in the internal registry; empty = none
+        type: string
+        default: ''
+      docker-context:
+        description: container build context; the wheels are copied into <context>/wheels/ before the build (default = project)
+        type: string
+        default: ''
+      docker-smoke:
+        description: shell command run against the built image (env IMAGE) before it is pushed
+        type: string
+        default: ''
+      docker-latest:
+        description: also tag a release image latest (only for Keel-deployed services)
+        type: boolean
+        default: false
+    outputs:
+      version:
+        value: ${{ jobs.version.outputs.version }}
+
+# Runner choice (RULES.md): a pull request of a PUBLIC repository never runs on the build farm.
+
+jobs:
+  version:
+    runs-on: ${{ (github.event_name == 'pull_request' && !github.event.repository.private) && 'ubuntu-latest' || fromJSON('["self-hosted","linux-build"]') }}
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      image-tag: ${{ steps.v.outputs.image-tag }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - id: d
+        env: { PROJECT: '${{ inputs.project }}' }
+        run: |
+          v=$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["project"]["version"])' "$PROJECT/pyproject.toml")
+          echo "declared=$v" >>"$GITHUB_OUTPUT"
+      - id: v
+        uses: garage49/.github/actions/version@main
+        with: { declared: '${{ steps.d.outputs.declared }}' }
+
+  build:
+    needs: version
+    runs-on: ${{ (github.event_name == 'pull_request' && !github.event.repository.private) && 'ubuntu-latest' || fromJSON('["self-hosted","linux-build"]') }}
+    container: python:${{ inputs.python-version }}-bookworm
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      PIP_ROOT_USER_ACTION: ignore
+    steps:
+      - uses: actions/checkout@v4
+      - name: install and check
+        working-directory: ${{ inputs.project }}
+        env: { EXTRA: '${{ inputs.test-extra }}' }
+        run: |
+          python -m venv /tmp/check && . /tmp/check/bin/activate
+          if [ -n "$EXTRA" ]; then pip install -q ".[$EXTRA]"; else pip install -q .; fi
+          ${{ inputs.checks }}
+      - name: stamp version, build the wheel, download the dependency wheels
+        env:
+          PROJECT: ${{ inputs.project }}
+          V: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # after the checks, so a check comparing the version file with another file sees the declared version
+          python - "$PROJECT/pyproject.toml" "$V" <<'PY'
+          import re, sys
+          path, v = sys.argv[1], sys.argv[2]
+          src = open(path, encoding="utf-8").read()
+          head, sep, rest = src.partition("[project]")
+          rest, n = re.subn(r'(?m)^version\s*=\s*"[^"]*"', f'version = "{v}"', rest, count=1)
+          if not sep or n != 1:
+              sys.exit(f"{path}: no version line in [project]")
+          open(path, "w", encoding="utf-8").write(head + sep + rest)
+          PY
+          python -m venv /tmp/build && . /tmp/build/bin/activate
+          pip install -q build
+          out="$GITHUB_WORKSPACE/py-dist"
+          rm -rf "$out" && mkdir -p "$out/wheels" "$out/release"
+          python -m build --wheel --outdir "$out/release" "$PROJECT"
+          wheel=$(ls "$out/release"/*.whl)
+          cp "$wheel" "$out/wheels/"
+          # the dependencies as binary wheels for this interpreter and platform; nothing is compiled
+          pip download -q --only-binary=:all: --dest "$out/wheels" "$wheel"
+          ls -l "$out/wheels"
+      - uses: actions/upload-artifact@v4
+        with: { name: python-wheels, path: py-dist/, retention-days: 7 }
+
+  docker:
+    needs: [version, build]
+    if: inputs.docker-image != '' && github.event_name != 'pull_request'
+    runs-on: [self-hosted, linux-build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: python-wheels, path: py-dist }
+      - env:
+          NAME: ${{ inputs.docker-image }}
+          CONTEXT: ${{ inputs.docker-context != '' && inputs.docker-context || inputs.project }}
+          TAG: ${{ needs.version.outputs.image-tag }}
+          V: ${{ needs.version.outputs.version }}
+          RELEASE: ${{ needs.version.outputs.release }}
+          LATEST: ${{ inputs.docker-latest }}
+          SMOKE: ${{ inputs.docker-smoke }}
+        run: |
+          # internal endpoints are set on the farm machines (runner .env), never in this public repo
+          IMAGE="${INTERNAL_DOCKER_REGISTRY:?not set on this runner}/$NAME"
+          rm -rf "$CONTEXT/wheels" && mkdir -p "$CONTEXT/wheels" && cp py-dist/wheels/*.whl "$CONTEXT/wheels/"
+          docker build --pull --build-arg VERSION="$V" -t "$IMAGE:$TAG" "$CONTEXT"
+          if [ -n "$SMOKE" ]; then IMAGE="$IMAGE:$TAG" bash -c "$SMOKE"; fi
+          docker push "$IMAGE:$TAG"
+          if [ "$RELEASE" = true ] && [ "$LATEST" = true ]; then
+            docker tag "$IMAGE:$TAG" "$IMAGE:latest" && docker push "$IMAGE:latest"
+          fi
+          echo "pushed $IMAGE:$TAG" >>"$GITHUB_STEP_SUMMARY"
+
+  release:
+    needs: [version, build, docker]
+    if: always() && needs.version.outputs.release == 'true' && needs.build.result == 'success' && (needs.docker.result == 'success' || needs.docker.result == 'skipped')
+    runs-on: [self-hosted, linux-build]
+    concurrency: release-${{ github.ref }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: python-wheels, path: py-dist }
+      - uses: garage49/.github/actions/release@main
+        with: { dir: py-dist/release, version: '${{ needs.version.outputs.version }}' }

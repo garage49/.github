@@ -57,6 +57,8 @@ public. A private repository that needs neither stays under `dirty49374`.
   `main` and fails otherwise (GitHub Free does not enforce branch protection on private repos).
 - Public repositories never run pull-request builds on the self-hosted runners (a fork's pull
   request could run code on them); they use GitHub-hosted runners.
+- A repository whose build covers only part of it may limit `push` and `pull_request` to those
+  paths plus its own `build.yml`. Tag pushes are never path-filtered, so a release always builds.
 
 ## Versions
 
@@ -103,6 +105,23 @@ installer fetching one asset verifies) and one `SHA256SUMS` listing them all.
 - Building and pushing an image is not a deployment: production upgrades of stateful services keep
   their own backup, candidate and digest-pin procedure.
 
+## Python packages
+
+- The version file is the project's `pyproject.toml` (`[project] version`).
+- Built **once** per run, in `python:<minor>-bookworm`:
+  - install the project with its test extra and run the repository's checks;
+  - stamp the build's version into `pyproject.toml`, so a check comparing the version file with
+    another file sees the declared version;
+  - build the project's wheel;
+  - download its dependencies as binary wheels for the same interpreter and platform. Nothing is
+    compiled.
+- Those exact wheels are the workflow artifact and what the container installs: copied into
+  `<context>/wheels/`, installed with `pip install --no-index`. The runtime base is
+  `python:<minor>-*-bookworm`.
+- Wheels carry their own file names, not `<os>-<arch>`. A release attaches the project's wheel with
+  its `.sha256`.
+- There is no private Python package index; one is added when a project needs it.
+
 ## Rust crates
 
 - A public crate goes to crates.io on a release tag only, from a GitHub-hosted runner with crates.io
@@ -116,7 +135,7 @@ installer fetching one asset verifies) and one `SHA256SUMS` listing them all.
 ## Using it
 
 Each repository has one workflow, `.github/workflows/build.yml`, that calls the shared ones it needs
-(`rust-build.yml`, `node-build.yml`, or both — they fill one GitHub Release per tag). A Rust example:
+(`rust-build.yml`, `node-build.yml`, `python-build.yml`, or several — they fill one GitHub Release per tag). A Rust example:
 
 ```yaml
 name: build
