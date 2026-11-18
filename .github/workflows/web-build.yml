@@ -1,0 +1,137 @@
+# Shared build for a static web app (rules: RULES.md in this repository).
+# A repository calls it from its own .github/workflows/build.yml:
+#
+#   on: { push: { branches: [main], tags: ['v*'] }, pull_request: {}, workflow_dispatch: {} }
+#   permissions: { contents: write, id-token: write }
+#   jobs:
+#     web:
+#       uses: garage49/.github/.github/workflows/web-build.yml@main
+#       with: { docker-image: my-app }
+#
+# One build per run: install with pnpm, run the checks, stamp the build's version into package.json,
+# build the bundle once. That exact bundle is the workflow artifact, what the container serves (copied
+# into <context>/web/, never rebuilt inside Docker) and what a release attaches as one tarball.
+#   main push    -> checks, bundle as workflow artifact (snapshot version stamped in), snapshot image
+#   pull request -> checks and bundle only
+#   tag vX.Y.Z   -> the same, release image, GitHub Release with the bundle tarball
+# The version file is the root package.json (version).
+name: web-build
+on:
+  workflow_call:
+    inputs:
+      checks:
+        description: shell command run after install, before the version stamp (lint, typecheck, tests)
+        type: string
+        default: 'pnpm lint && pnpm test'
+      build:
+        description: shell command that builds the bundle, run after the version stamp
+        type: string
+        default: 'pnpm build'
+      output:
+        description: directory the build writes the bundle to
+        type: string
+        default: 'dist'
+      docker-image:
+        description: image name in the internal registry; empty = none
+        type: string
+        default: ''
+      docker-context:
+        description: container build context; the bundle is copied into <context>/web/ before the build
+        type: string
+        default: '.'
+      docker-smoke:
+        description: shell command run against the built image (env IMAGE) before it is pushed
+        type: string
+        default: ''
+      docker-latest:
+        description: also tag a release image latest (only for Keel-deployed services)
+        type: boolean
+        default: false
+    outputs:
+      version:
+        value: ${{ jobs.version.outputs.version }}
+
+# Runner choice (RULES.md): a pull request of a PUBLIC repository never runs on the build farm.
+
+jobs:
+  version:
+    runs-on: ${{ (github.event_name == 'pull_request' && !github.event.repository.private) && 'ubuntu-latest' || fromJSON('["self-hosted","linux-build"]') }}
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      image-tag: ${{ steps.v.outputs.image-tag }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - id: d
+        run: echo "declared=$(jq -r .version package.json)" >>"$GITHUB_OUTPUT"
+      - id: v
+        uses: garage49/.github/actions/version@main
+        with: { declared: '${{ steps.d.outputs.declared }}' }
+
+  build:
+    needs: version
+    runs-on: ${{ (github.event_name == 'pull_request' && !github.event.repository.private) && 'ubuntu-latest' || fromJSON('["self-hosted","linux-build"]') }}
+    container: node:24-bookworm
+    defaults: { run: { shell: bash } }   # a job container's default shell is sh
+    steps:
+      - uses: actions/checkout@v4
+      - run: corepack enable && pnpm install --frozen-lockfile
+      - run: ${{ inputs.checks }}
+      - name: stamp version and build the bundle
+        env:
+          V: ${{ needs.version.outputs.version }}
+          OUT: ${{ inputs.output }}
+        run: |
+          set -euo pipefail
+          # after the checks, so a check comparing the version file with another file sees the declared version
+          npm pkg set version="$V"
+          rm -rf "$OUT"
+          ${{ inputs.build }}
+          [ -f "$OUT/index.html" ] || { echo "::error::$OUT/index.html missing after the build"; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/web-dist"
+          tar -C "$OUT" -czf "$GITHUB_WORKSPACE/web-dist/${GITHUB_REPOSITORY#*/}-web-$V.tar.gz" .
+          ls -l "$GITHUB_WORKSPACE/web-dist"
+      - uses: actions/upload-artifact@v4
+        with: { name: web-bundle, path: web-dist/, retention-days: 7 }
+
+  docker:
+    needs: [version, build]
+    if: inputs.docker-image != '' && github.event_name != 'pull_request'
+    runs-on: [self-hosted, linux-build]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: web-bundle, path: web-dist }
+      - env:
+          NAME: ${{ inputs.docker-image }}
+          CONTEXT: ${{ inputs.docker-context }}
+          TAG: ${{ needs.version.outputs.image-tag }}
+          V: ${{ needs.version.outputs.version }}
+          RELEASE: ${{ needs.version.outputs.release }}
+          LATEST: ${{ inputs.docker-latest }}
+          SMOKE: ${{ inputs.docker-smoke }}
+        run: |
+          set -euo pipefail
+          # internal endpoints are set on the farm machines (runner .env), never in this public repo
+          IMAGE="${INTERNAL_DOCKER_REGISTRY:?not set on this runner}/$NAME"
+          rm -rf "$CONTEXT/web" && mkdir -p "$CONTEXT/web"
+          tar -C "$CONTEXT/web" -xzf web-dist/*-web-"$V".tar.gz
+          docker build --pull --build-arg VERSION="$V" -t "$IMAGE:$TAG" "$CONTEXT"
+          if [ -n "$SMOKE" ]; then IMAGE="$IMAGE:$TAG" bash -c "$SMOKE"; fi
+          docker push "$IMAGE:$TAG"
+          if [ "$RELEASE" = true ] && [ "$LATEST" = true ]; then
+            docker tag "$IMAGE:$TAG" "$IMAGE:latest" && docker push "$IMAGE:latest"
+          fi
+          echo "pushed $IMAGE:$TAG" >>"$GITHUB_STEP_SUMMARY"
+
+  release:
+    needs: [version, build, docker]
+    if: always() && needs.version.outputs.release == 'true' && needs.build.result == 'success' && (needs.docker.result == 'success' || needs.docker.result == 'skipped')
+    runs-on: [self-hosted, linux-build]
+    concurrency: release-${{ github.ref }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: web-bundle, path: web-dist }
+      - uses: garage49/.github/actions/release@main
+        with: { dir: web-dist, version: '${{ needs.version.outputs.version }}' }

@@ -25,8 +25,9 @@ public. A private repository that needs neither stays under `dirty49374`.
   runtime from the exact artifacts the run already built, so a release asset and the image carry
   the same bytes and nothing is built twice: npm tarballs in `<context>/npm/`, Rust release binaries
   (built in `rust:1-bookworm`, so the runtime base is Debian bookworm or newer) in
-  `<path>/docker-bin/`, each named after its binary, and a Rust workflow's `prebuild` output (e.g. a
-  web bundle) at its `prebuild-path`. A Dockerfile has no build stage; a `.dockerignore` allow-list
+  `<path>/docker-bin/`, each named after its binary, a Rust workflow's `prebuild` output (e.g. a
+  web bundle) at its `prebuild-path`, Python wheels in `<context>/wheels/`, and a static web app's
+  bundle in `<context>/web/`. A Dockerfile has no build stage; a `.dockerignore` allow-list
   must admit those directories.
 
 ## Making a repository public
@@ -121,6 +122,18 @@ installer fetching one asset verifies) and one `SHA256SUMS` listing them all.
 - Wheels carry their own file names, not `<os>-<arch>`. A release attaches the project's wheel with
   its `.sha256`.
 - There is no private Python package index; one is added when a project needs it.
+
+## Static web apps
+
+- A static web app (a bundle served as files, not an npm package) builds with `web-build.yml`. The
+  version file is the root `package.json` (`version`); the package manager is pnpm
+  (`pnpm install --frozen-lockfile`), as for npm packages.
+- Built **once** per run: install, the repository's checks, then the build's version is stamped into
+  `package.json` and the bundle is built. That exact bundle is the workflow artifact, what the
+  container serves (unpacked into `<context>/web/`) and what a release attaches.
+- A release attaches the bundle as one tarball, `<repo>-web-<version>.tar.gz`, with its `.sha256`.
+- The Dockerfile only assembles the server around it (for example `FROM nginx:alpine`, its config,
+  `COPY web/ …`); runtime configuration is mounted by the deployment, never baked into the bundle.
 
 ## Rust crates
 
