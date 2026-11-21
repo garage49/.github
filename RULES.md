@@ -25,7 +25,7 @@ public. A private repository that needs neither stays under `dirty49374`.
   runtime from the exact artifacts the run already built, so a release asset and the image carry
   the same bytes and nothing is built twice: npm tarballs in `<context>/npm/`, Rust release binaries
   (built in `rust:1-bookworm`, so the runtime base is Debian bookworm or newer) in
-  `<path>/docker-bin/`, each named after its binary, a Rust workflow's `prebuild` output (e.g. a
+  `<path>/docker-bin/`, each named after its binary, Go static binaries in `<context>/docker-bin/`, a Rust workflow's `prebuild` output (e.g. a
   web bundle) at its `prebuild-path`, Python wheels in `<context>/wheels/`, and a static web app's
   bundle in `<context>/web/`. A Dockerfile has no build stage; a `.dockerignore` allow-list
   must admit those directories.
@@ -123,6 +123,22 @@ installer fetching one asset verifies) and one `SHA256SUMS` listing them all.
   its `.sha256`.
 - There is no private Python package index; one is added when a project needs it.
 
+## Go programs
+
+- A Go program builds with `go-build.yml`. Go has no version file of its own, so the repository names
+  one (`version-file`, a top-level `version` in a `.yaml`, `.toml` or `.json` file).
+- The toolchain is the one `go.mod` asks for: the build container is `golang:<version>-bookworm`, where
+  `<version>` is the `toolchain` directive, else the `go` directive, and nothing else is downloaded
+  (`GOTOOLCHAIN=local`).
+- Built **once** per run: the repository's checks (default `go vet ./...` and `go test -race ./...`),
+  then each target cross-compiled from Linux as a static binary (`CGO_ENABLED=0`, `-trimpath`,
+  `-ldflags "-s -w"`, plus `-X <version-var>=<version>` when the repository names a version
+  variable). Those exact binaries are the workflow artifact, what the image copies (the
+  linux-x86_64 binary in `<context>/docker-bin/`, named after the binary) and what a release
+  attaches as `<name>-<os>-<arch>[.exe]`.
+- The runtime base is static: a distroless `static` or `scratch` image, or any other base, since
+  the binary needs no libc.
+
 ## Static web apps
 
 - A static web app (a bundle served as files, not an npm package) builds with `web-build.yml`. The
@@ -148,7 +164,7 @@ installer fetching one asset verifies) and one `SHA256SUMS` listing them all.
 ## Using it
 
 Each repository has one workflow, `.github/workflows/build.yml`, that calls the shared ones it needs
-(`rust-build.yml`, `node-build.yml`, `python-build.yml`, or several — they fill one GitHub Release per tag). A Rust example:
+(`rust-build.yml`, `node-build.yml`, `python-build.yml`, `go-build.yml`, `web-build.yml`, or several — they fill one GitHub Release per tag). A Rust example:
 
 ```yaml
 name: build

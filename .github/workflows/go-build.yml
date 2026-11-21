@@ -1,0 +1,201 @@
+# Shared build for Go programs on the garage49 build farm (rules: RULES.md in this repository).
+# A repository calls it from its own .github/workflows/build.yml:
+#
+#   on: { push: { branches: [main], tags: ['v*'] }, pull_request: {}, workflow_dispatch: {} }
+#   permissions: { contents: write, id-token: write }   # every caller grants both (RULES.md)
+#   jobs:
+#     build:
+#       uses: garage49/.github/.github/workflows/go-build.yml@main
+#       with: { name: gateway, package: ./cmd/gateway, version-file: VERSION.yaml, docker-image: my-gateway }
+#
+# One build per run, in golang:<go.mod version>-bookworm (the toolchain directive if go.mod has one, else
+# the go directive; GOTOOLCHAIN=local, so nothing is downloaded): the checks, then every target
+# cross-compiled once as a static binary (CGO_ENABLED=0, -trimpath, -s -w). Those exact binaries are
+# the workflow artifacts, what the image COPYs (the linux-x86_64 binary, named <bin>, in
+# <context>/docker-bin/; never compiled in Docker) and what a release attaches.
+#   main push    -> checks, binaries as workflow artifacts (snapshot version), snapshot image
+#   pull request -> checks and binaries only
+#   tag vX.Y.Z   -> the same, release image, GitHub Release with <name>-<os>-<arch> assets
+# Go has no version file of its own: the repository names one (version-file, top-level `version`).
+name: go-build
+on:
+  workflow_call:
+    inputs:
+      name:
+        description: asset base name, <name>-<os>-<arch>
+        type: string
+        required: true
+      package:
+        description: main package to build, relative to path (e.g. ./cmd/gateway)
+        type: string
+        required: true
+      bin:
+        description: binary name in <context>/docker-bin/ (default = last element of package)
+        type: string
+        default: ''
+      path:
+        description: directory holding go.mod
+        type: string
+        default: '.'
+      version-file:
+        description: file whose top-level `version` is the declared version (.yaml, .yml, .toml or .json; relative to the repository root)
+        type: string
+        required: true
+      version-var:
+        description: optional string variable that receives the build's version (-ldflags -X, e.g. main.version)
+        type: string
+        default: ''
+      targets:
+        description: JSON list from linux-x86_64, linux-aarch64, macos-aarch64, macos-x86_64, windows-x86_64 (all cross-compiled on Linux)
+        type: string
+        default: '["linux-x86_64"]'
+      checks:
+        description: shell command run in path before building (cgo available, for -race)
+        type: string
+        default: 'go vet ./... && go test -race ./...'
+      docker-image:
+        description: image name in the internal registry, built from <context>/Dockerfile; empty = none
+        type: string
+        default: ''
+      docker-context:
+        description: container build context; the linux-x86_64 binary is copied into <context>/docker-bin/<bin> (default = path)
+        type: string
+        default: ''
+      docker-smoke:
+        description: shell command run against the built image (env IMAGE) before it is pushed
+        type: string
+        default: ''
+      docker-latest:
+        description: also tag a release image latest (only for Keel-deployed services)
+        type: boolean
+        default: false
+    outputs:
+      version:
+        value: ${{ jobs.version.outputs.version }}
+
+# Runner choice (RULES.md): a pull request of a PUBLIC repository never runs on the build farm.
+
+jobs:
+  version:
+    runs-on: ${{ (github.event_name == 'pull_request' && !github.event.repository.private) && 'ubuntu-latest' || fromJSON('["self-hosted","linux-build"]') }}
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      image-tag: ${{ steps.v.outputs.image-tag }}
+      release: ${{ steps.v.outputs.release }}
+      go: ${{ steps.d.outputs.go }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - id: d
+        env:
+          FILE: ${{ inputs.version-file }}
+          MOD: ${{ inputs.path }}/go.mod
+          TARGETS: '${{ inputs.targets }}'
+          IMAGE: ${{ inputs.docker-image }}
+        run: |
+          set -euo pipefail
+          case "$FILE" in
+            *.json) v=$(jq -r .version "$FILE") ;;
+            *.toml) v=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' "$FILE" | head -1) ;;
+            *.yaml|*.yml) v=$(sed -n "s/^version: *[\"']\{0,1\}\([^\"' #]*\).*/\1/p" "$FILE" | head -1) ;;
+            *) echo "::error::version file $FILE: only .yaml, .yml, .toml or .json"; exit 1 ;;
+          esac
+          [ -n "$v" ] && [ "$v" != null ] || { echo "::error::$FILE has no top-level version"; exit 1; }
+          echo "declared=$v" >>"$GITHUB_OUTPUT"
+          go=$(sed -n 's/^toolchain go\([0-9.]*\).*/\1/p' "$MOD" | head -1)
+          [ -n "$go" ] || go=$(sed -n 's/^go \([0-9.]*\).*/\1/p' "$MOD" | head -1)
+          [ -n "$go" ] || { echo "::error::$MOD has no go directive"; exit 1; }
+          echo "go=$go" >>"$GITHUB_OUTPUT"
+          echo "$TARGETS" | jq -e 'length > 0 and all(. as $t | ["linux-x86_64","linux-aarch64","macos-aarch64","macos-x86_64","windows-x86_64"] | index($t))' >/dev/null \
+            || { echo "::error::targets must be a non-empty list of known targets, got $TARGETS"; exit 1; }
+          if [ -n "$IMAGE" ] && ! echo "$TARGETS" | jq -e 'index("linux-x86_64") != null' >/dev/null; then
+            echo "::error::docker-image needs linux-x86_64 in targets: the image is built from that binary"; exit 1
+          fi
+      - id: v
+        uses: garage49/.github/actions/version@main
+        with: { declared: '${{ steps.d.outputs.declared }}' }
+
+  build:
+    needs: version
+    runs-on: ${{ (github.event_name == 'pull_request' && !github.event.repository.private) && 'ubuntu-latest' || fromJSON('["self-hosted","linux-build"]') }}
+    container: golang:${{ needs.version.outputs.go }}-bookworm
+    defaults: { run: { shell: bash } }   # a job container's default shell is sh
+    env:
+      GOTOOLCHAIN: local
+      GOFLAGS: -buildvcs=false   # no VCS stamping: the binary carries only the build's version (version-var)
+    steps:
+      - uses: actions/checkout@v4
+      - name: checks
+        working-directory: ${{ inputs.path }}
+        run: ${{ inputs.checks }}
+      - name: build every target
+        working-directory: ${{ inputs.path }}
+        env:
+          NAME: ${{ inputs.name }}
+          PKG: ${{ inputs.package }}
+          BIN: ${{ inputs.bin }}
+          TARGETS: '${{ inputs.targets }}'
+          VAR: ${{ inputs.version-var }}
+          V: ${{ needs.version.outputs.version }}
+          IMAGE: ${{ inputs.docker-image }}
+        run: |
+          set -euo pipefail
+          bin=${BIN:-$(basename "$PKG")}
+          ld="-s -w"; [ -z "$VAR" ] || ld="$ld -X $VAR=$V"
+          rm -rf "$GITHUB_WORKSPACE/dist" "$GITHUB_WORKSPACE/docker-bin" && mkdir -p "$GITHUB_WORKSPACE/dist"
+          for t in $(echo "$TARGETS" | tr -d '[]" ' | tr ',' ' '); do   # a JSON list of names; no jq in golang images
+            os=${t%-*} arch=${t#*-}; ext=
+            case $os in macos) goos=darwin ;; windows) goos=windows ext=.exe ;; *) goos=$os ;; esac
+            case $arch in x86_64) goarch=amd64 ;; aarch64) goarch=arm64 ;; esac
+            CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch go build -trimpath -ldflags="$ld" -o "$GITHUB_WORKSPACE/dist/$NAME-$t$ext" "$PKG"
+          done
+          # the image's binary: this exact file, never rebuilt in Docker (RULES.md)
+          if [ -n "$IMAGE" ]; then
+            mkdir -p "$GITHUB_WORKSPACE/docker-bin" && cp "$GITHUB_WORKSPACE/dist/$NAME-linux-x86_64" "$GITHUB_WORKSPACE/docker-bin/$bin"
+          fi
+          ls -l "$GITHUB_WORKSPACE/dist"
+      - uses: actions/upload-artifact@v4
+        with: { name: '${{ inputs.name }}-binaries', path: dist/*, retention-days: 7 }
+      - if: inputs.docker-image != ''
+        uses: actions/upload-artifact@v4
+        with: { name: docker-bin, path: docker-bin/*, retention-days: 7 }
+
+  docker:
+    needs: [version, build]
+    if: inputs.docker-image != '' && github.event_name != 'pull_request'
+    runs-on: [self-hosted, linux-build]
+    env:
+      CONTEXT: ${{ inputs.docker-context != '' && inputs.docker-context || inputs.path }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: docker-bin, path: '${{ env.CONTEXT }}/docker-bin' }
+      - env:
+          NAME: ${{ inputs.docker-image }}
+          TAG: ${{ needs.version.outputs.image-tag }}
+          V: ${{ needs.version.outputs.version }}
+          RELEASE: ${{ needs.version.outputs.release }}
+          LATEST: ${{ inputs.docker-latest }}
+          SMOKE: ${{ inputs.docker-smoke }}
+        run: |
+          # internal endpoints are set on the farm machines (runner .env), never in this public repo
+          IMAGE="${INTERNAL_DOCKER_REGISTRY:?not set on this runner}/$NAME"
+          chmod +x "$CONTEXT"/docker-bin/* && ls -l "$CONTEXT/docker-bin"   # artifacts drop the exec bit
+          docker build --pull --build-arg VERSION="$V" -t "$IMAGE:$TAG" "$CONTEXT"
+          if [ -n "$SMOKE" ]; then IMAGE="$IMAGE:$TAG" bash -c "$SMOKE"; fi
+          docker push "$IMAGE:$TAG"
+          if [ "$RELEASE" = true ] && [ "$LATEST" = true ]; then
+            docker tag "$IMAGE:$TAG" "$IMAGE:latest" && docker push "$IMAGE:latest"
+          fi
+          echo "pushed $IMAGE:$TAG" >>"$GITHUB_STEP_SUMMARY"
+
+  release:
+    needs: [version, build, docker]
+    if: always() && needs.version.outputs.release == 'true' && needs.build.result == 'success' && (needs.docker.result == 'success' || needs.docker.result == 'skipped')
+    runs-on: [self-hosted, linux-build]
+    concurrency: release-${{ github.ref }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: '${{ inputs.name }}-binaries', path: dist }
+      - uses: garage49/.github/actions/release@main
+        with: { dir: dist, version: '${{ needs.version.outputs.version }}' }
